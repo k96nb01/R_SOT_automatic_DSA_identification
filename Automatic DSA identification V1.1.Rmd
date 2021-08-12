@@ -1,0 +1,291 @@
+bin---
+title: "Automatic DSA identification V1.0"
+output: html_notebook
+---
+```{r}
+#Loading libraries. 
+#The memory.limit function was required on the computer I used to increase the memory size so that large tables could be loaded. It may not be needed in all cases.
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+memory.limit(size=56000)
+```
+
+```{r}
+#Load HistoTrac tables.
+(Patient <- readRDS(file = "Patient.rds"))
+(PatientCase <- readRDS(file = "PatientCase.rds"))
+(RelatedPatient <- readRDS(file = "RelatedPatient.rds"))
+(TestDetail <- readRDS(file = "TestDetail.rds"))
+(Sample <- readRDS(file = "Sample.rds"))
+(Test <- readRDS(file = "Test.rds"))
+(UserTest <- readRDS(file = "UserTest.rds"))
+(TransplantHistory <- readRDS(file = "TransplantHistory.rds"))
+(Xmatch <- readRDS(file = "Xmatch.rds"))
+```
+
+```{r}
+#Generate a simplified patient table. 
+(Simple_patients <- Patient 
+   %>% filter(PatientTypeCd == "Patient")
+   %>% select(PatientId, HospitalID, firstnm, lastnm, DOB, categoryCd: GenderCd, A1Cd:dq2cd, PatientTypeCd, mA1Cd:mDPB12NMDPcd, StatusCd, UnacceptAntigenTxt, mA1EqCd, mDPB12EqCd, UNOSCPRAAmt, UNOSUnacceptAntigenTxt)
+      )
+
+#Generate a simplified donor table.
+(Simple_donors <- Patient 
+   %>% filter(PatientTypeCd == "Donor")
+   %>% select(PatientId:HospitalID, firstnm, lastnm, DOB, categoryCd: GenderCd, A1Cd:dq2cd, PatientTypeCd, mA1Cd:mDPB12NMDPcd, StatusCd, UnacceptAntigenTxt, mA1EqCd, mDPB12EqCd, UNOSCPRAAmt, UNOSUnacceptAntigenTxt)
+      )
+```
+
+```{r}
+#Filter heart patients. 
+(Heart_Patients <- Patient 
+   %>% filter(categoryCd == "Heart") 
+   )
+
+#Filter TransplantHistory table for donors (contains other sensitizing events like pregnancies and transfusions)
+(Transplants <- TransplantHistory %>% filter(EventCd == "Transplant" | EventCd == "TXP DSA" | EventCd == "TXP EXT"))
+
+#Find the donors for heart patients
+#Join Heart_Patients to Transplants. The inner_join only keeps patients that have been transplanted (according to HistoTrac records). Column "DonorId" should always be the UNOS ID, if we have it. Joining to Simple_donors adds the donor info. Note that by joining to UNOSId it should only be finding deceased donors from solid organ transplants, as they should be the only ones with UNOS IDs.
+
+(Transplanted_heart_patients_and_donors <- Heart_Patients
+   %>% inner_join(Transplants, by = "PatientId")
+   %>% mutate(across(where(is.character), ~na_if(., "")))
+   %>% filter(!is.na(DonorId))
+   %>% left_join(Simple_donors, by = c("DonorId" = "UNOSId"), suffix = c(".recipient", ".donor"))
+   %>% select(PatientId.recipient:categoryCd.recipient, RaceCd.recipient:dq2cd.recipient, mDQA11Cd.recipient:mDQA12Cd.recipient, mDPA11Cd.recipient:mDPB12cd.recipient, TransplantId:TransplantDt, MismatchTxt, EventCd:OrganCd, PatientId.donor:DOB.donor, RaceCd.donor:dq2cd.donor, mDQA11Cd.donor:mDQA12Cd.donor, mDPA11Cd.donor:mDPB12cd.donor)
+      )
+```
+
+```{r}
+#Now I have a table with recipients and their transplanted donors, with the transplant date, and the HLA typing of the recipients and donors. Next I want to find all post-transplant antibody tests.
+
+#Join to the Sample, Test, and UserTest tables.
+(post_Tx_Ab_tests_a <- Transplanted_heart_patients_and_donors
+   %>% left_join(Sample, by = c("PatientId.recipient" = "PatientId"))
+   %>% select(PatientId.recipient:mDPB12cd.donor, SampleID, SampleNbr, SampleDt, SpecimenTypeCd, StatusCd)
+   %>% filter (str_detect(StatusCd, 'POST')) #This was the oddest thing, but I couldn't directly filter on "Post" for some reason. So, I used the stringr function, which did the same thing.
+       )
+
+#For some reason I couldn't pipe in the next line of code in the above expression, so I had to generate a new table to do so.
+(post_Tx_Ab_tests <- post_Tx_Ab_tests_a
+   %>% left_join(Test, by = c("SampleID" = "SampleId")) 
+   %>% select(PatientId.recipient:TreatmentCd, TestMethodCd)
+   %>% filter(TestTypeCd == "HLA DSA1" | TestTypeCd == "HLA DSA2" | TestTypeCd == "HLA LSA1" | TestTypeCd == "HLA LSA2" | TestTypeCd == "HLADSA1" | TestTypeCd == "HLADSA2" | TestTypeCd == "HLALSA1" | TestTypeCd == "HLALSA2" | TestTypeCd == "LSA1" | TestTypeCd == "LSA2")
+   %>% mutate(across(where(is.character), ~na_if(., "")))
+)
+```
+ 
+```{r}
+#Now I have the patients and their donors. Next I want to calculate the mismatched donor antigens so I can use that to search for DSAs to those antigens.
+#The mutate function makes new columns for mismatches at each locus in the host-versus-graft direction (i.e. what does the recipient see as foreign in the allograft?). For the first line of code, the code makes a new column called "A.1.mismatch," and then looks at the value of "A1Cd.donor" to see if it is present in either "A1Cd.recipient" or "A1Cd.recipient." If it finds the value in either, then it records "NA" in "A1Cd.donor." The "TRUE" argument copies the value of "A1Cd.donor" whenever that value is not found in either of the recipient columns. An easier way to understand this is to see that "case_when" is similar to "if_else:" if the value of "A1Cd.donor" is found in either "A1Cd.recipient" or "A1Cd.recipient," then record "NA," else, copy the value of "A1Cd.donor."
+(post_Tx_Ab_tests_MM <- post_Tx_Ab_tests 
+   %>% mutate(A.1.mismatch = case_when(A1Cd.donor == A1Cd.recipient | A1Cd.donor == A1Cd.recipient ~ NA_character_, TRUE ~ as.character(A1Cd.donor))) 
+   %>% mutate(A.2.mismatch = case_when(A2Cd.donor == A1Cd.recipient | A2Cd.donor == A2Cd.recipient ~ NA_character_, TRUE ~ as.character(A2Cd.donor)))
+   %>% mutate(B.1.mismatch = case_when(B1Cd.donor == B1Cd.recipient | B1Cd.donor == B2Cd.recipient ~ NA_character_, TRUE ~ as.character(B1Cd.donor))) 
+   %>% mutate(B.2.mismatch = case_when(B2Cd.donor == B1Cd.recipient | B2Cd.donor == B2Cd.recipient ~ NA_character_, TRUE ~ as.character(B2Cd.donor)))
+   %>% mutate(Cw.1.mismatch = case_when(Cw1Cd.donor == Cw1Cd.recipient | Cw1Cd.donor == Cw2Cd.recipient ~ NA_character_, TRUE ~ as.character(Cw1Cd.donor))) 
+   %>% mutate(Cw.2.mismatch = case_when(Cw2Cd.donor == Cw1Cd.recipient | Cw2Cd.donor == Cw2Cd.recipient ~ NA_character_, TRUE ~ as.character(Cw2Cd.donor)))
+   %>% mutate(DR.1.mismatch = case_when(DR1Cd.donor == DR1Cd.recipient | DR1Cd.donor == DR2Cd.recipient ~ NA_character_, TRUE ~ as.character(DR1Cd.donor))) 
+   %>% mutate(DR.2.mismatch = case_when(DR2Cd.donor == DR1Cd.recipient | DR2Cd.donor == DR2Cd.recipient ~ NA_character_, TRUE ~ as.character(DR2Cd.donor)))
+   %>% mutate(DR.51.52.53.1.mismatch = case_when(drw1cd.donor == drw1cd.recipient | drw1cd.donor == drw2cd.recipient ~ NA_character_, TRUE ~ as.character(drw1cd.donor)))
+   %>% mutate(DR.51.52.53.2.mismatch = case_when(drw2cd.donor == drw1cd.recipient | drw2cd.donor == drw2cd.recipient ~ NA_character_, TRUE ~ as.character(drw2cd.donor)))
+   %>% mutate(DQ.1.mismatch = case_when(dq1cd.donor == dq1cd.recipient | dq1cd.donor == dq2cd.recipient ~ NA_character_, TRUE ~ as.character(dq1cd.donor))) 
+   %>% mutate(DQ.2.mismatch = case_when(dq2cd.donor == dq1cd.recipient | dq2cd.donor == dq2cd.recipient ~ NA_character_, TRUE ~ as.character(dq2cd.donor)))
+   %>% mutate(DP.1.mismatch = case_when(mDPB11cd.donor == mDPB11cd.recipient | mDPB11cd.donor == mDPB12cd.recipient ~ NA_character_, TRUE ~ as.character(mDPB11cd.donor))) 
+   %>% mutate(DP.2.mismatch = case_when(mDPB12cd.donor == mDPB11cd.recipient | mDPB12cd.donor == mDPB12cd.recipient ~ NA_character_, TRUE ~ as.character(mDPB12cd.donor)))
+   )
+
+#The DP mismatches are problematic: most are listed in molecular typing (01:01), and need to be be converted to pseudo-serologic typing as reported by the SAB results (DP1). Some are listed with one field (02) and some are listed with two fields (02:01).
+
+#Remove the miscellaneous characters in mismatch typing. There are some that cannot be easily removed, such as two separate typings entered into one entry (e.g. "2,28"). This is written is base R, which is why the syntax is different from the tidyverse syntax I'm used to. The sub function replaces something with whatever you specify.
+post_Tx_Ab_tests_MM$A.2.mismatch <- sub("[-]", "", post_Tx_Ab_tests_MM$A.2.mismatch)
+post_Tx_Ab_tests_MM$B.2.mismatch <- sub("[-]", "", post_Tx_Ab_tests_MM$B.2.mismatch)
+post_Tx_Ab_tests_MM$Cw.1.mismatch <- sub("[w*]", "", post_Tx_Ab_tests_MM$Cw.1.mismatch)
+post_Tx_Ab_tests_MM$Cw.2.mismatch <- sub("[w*-]", "", post_Tx_Ab_tests_MM$Cw.2.mismatch)
+#Note that some C values have leading zeros after removal of w or *. Will have to convert these to single digits.
+post_Tx_Ab_tests_MM$DR.51.52.53.1.mismatch <- sub("[,]", "", post_Tx_Ab_tests_MM$DR.51.52.53.1.mismatch)
+post_Tx_Ab_tests_MM$DR.51.52.53.2.mismatch <- sub("[,]", "", post_Tx_Ab_tests_MM$DR.51.52.53.2.mismatch)
+post_Tx_Ab_tests_MM$DP.1.mismatch <- sub("[Gv]", "", post_Tx_Ab_tests_MM$DP.1.mismatch)
+post_Tx_Ab_tests_MM$DP.2.mismatch <- sub("[VG]", "", post_Tx_Ab_tests_MM$DP.2.mismatch)
+#Remove the second field (colon and two numbers after) from DP typings
+post_Tx_Ab_tests_MM$DP.1.mismatch <- sub(":[0-9][0-9]", "", post_Tx_Ab_tests_MM$DP.1.mismatch)
+post_Tx_Ab_tests_MM$DP.2.mismatch <- sub(":[0-9][0-9]", "", post_Tx_Ab_tests_MM$DP.2.mismatch)
+
+#Recode blank values as "NA."
+(post_Tx_Ab_tests_MM_clean <- post_Tx_Ab_tests_MM 
+   %>% mutate(across(where(is.character), ~na_if(., "")))
+   
+#Remove leading zeros in typings by converting to integers. This will also remove any of the odd entries in the typings (e.g. 2,68).
+   %>% mutate(A.1.mismatch = as.integer(A.1.mismatch))
+   %>% mutate(A.2.mismatch = as.integer(A.2.mismatch))
+   %>% mutate(B.1.mismatch = as.integer(B.1.mismatch))
+   %>% mutate(B.2.mismatch = as.integer(B.2.mismatch))
+   %>% mutate(Cw.1.mismatch = as.integer(Cw.1.mismatch))
+   %>% mutate(Cw.2.mismatch = as.integer(Cw.2.mismatch))
+   %>% mutate(DR.1.mismatch = as.integer(DR.1.mismatch))
+   %>% mutate(DR.2.mismatch = as.integer(DR.2.mismatch))
+   %>% mutate(DR.51.52.53.1.mismatch = as.integer(DR.51.52.53.1.mismatch))
+   %>% mutate(DR.51.52.53.2.mismatch = as.integer(DR.51.52.53.2.mismatch))
+   %>% mutate(DQ.1.mismatch = as.integer(DQ.1.mismatch))
+   %>% mutate(DQ.2.mismatch = as.integer(DQ.2.mismatch))
+   %>% mutate(DP.1.mismatch = as.integer(DP.1.mismatch))
+   %>% mutate(DP.2.mismatch = as.integer(DP.2.mismatch))
+   )
+
+#There is no need to convert back to characters, as this will be done automatically by the next set of code when characters are inserted before the typings.
+
+#This will add "A" or "B" or "DR," etc. in front of the typing values. This is required to match to the SAB data, since the typing from the SAB results are in the format "A1, B8, DR17," etc.  The ^ symbol means the beginning of a character set, so it is "replacing" the beginning of a character set with "A", at the data frame and column specified. Putting () around the entire expression won't print the tibble like I'm used to, so a separate line of code needs to be used to print the tibble.
+post_Tx_Ab_tests_MM_clean$A.1.mismatch <- sub("^", "A", post_Tx_Ab_tests_MM_clean$A.1.mismatch)
+post_Tx_Ab_tests_MM_clean$A.2.mismatch <- sub("^", "A", post_Tx_Ab_tests_MM_clean$A.2.mismatch)
+post_Tx_Ab_tests_MM_clean$B.1.mismatch <- sub("^", "B", post_Tx_Ab_tests_MM_clean$B.1.mismatch)
+post_Tx_Ab_tests_MM_clean$B.2.mismatch <- sub("^", "B", post_Tx_Ab_tests_MM_clean$B.2.mismatch)
+post_Tx_Ab_tests_MM_clean$Cw.1.mismatch <- sub("^", "Cw", post_Tx_Ab_tests_MM_clean$Cw.1.mismatch)
+post_Tx_Ab_tests_MM_clean$Cw.2.mismatch <- sub("^", "Cw", post_Tx_Ab_tests_MM_clean$Cw.2.mismatch)
+post_Tx_Ab_tests_MM_clean$DR.1.mismatch <- sub("^", "DR", post_Tx_Ab_tests_MM_clean$DR.1.mismatch)
+post_Tx_Ab_tests_MM_clean$DR.2.mismatch <- sub("^", "DR", post_Tx_Ab_tests_MM_clean$DR.2.mismatch)
+post_Tx_Ab_tests_MM_clean$DR.51.52.53.1.mismatch <- sub("^", "DR", post_Tx_Ab_tests_MM_clean$DR.51.52.53.1.mismatch)
+post_Tx_Ab_tests_MM_clean$DR.51.52.53.2.mismatch <- sub("^", "DR", post_Tx_Ab_tests_MM_clean$DR.51.52.53.2.mismatch)
+post_Tx_Ab_tests_MM_clean$DQ.1.mismatch <- sub("^", "DQ", post_Tx_Ab_tests_MM_clean$DQ.1.mismatch)
+post_Tx_Ab_tests_MM_clean$DQ.2.mismatch <- sub("^", "DQ", post_Tx_Ab_tests_MM_clean$DQ.2.mismatch)
+post_Tx_Ab_tests_MM_clean$DP.1.mismatch <- sub("^", "DP", post_Tx_Ab_tests_MM_clean$DP.1.mismatch)
+post_Tx_Ab_tests_MM_clean$DP.2.mismatch <- sub("^", "DP", post_Tx_Ab_tests_MM_clean$DP.2.mismatch)
+post_Tx_Ab_tests_MM_clean
+
+#Now I have the donor mismatches for all loci (except DPA and DQA - a problem for another time). I can use that to search for SAB results >1,000 MFI to determine DSAs.
+```
+
+```{r}
+#The TestDetail table contains all of the SAB results in multiple rows. It also contains lots of other types of results, so it would be best to sort for SAB tests. Unfortunately, there is not a specific value that marks a row as coming from an SAB test.
+
+#The best way to determine which rows are from SAB results is to determine which TestId values came from SAB tests. That data is in the Test table.
+
+#Start by filtering against the list of SAB tests as defined by the "post_Tx_Ab_tests" table.
+(TestDetail_SAB <- TestDetail
+   %>% semi_join(post_Tx_Ab_tests, by = "TestId")
+ 
+#Next filter by rows that have MFIs, as these will be SAB results.
+   %>% filter(!is.na(SingleAgNormalized))
+
+#Select only pertinent columns to simplify the table
+   %>% select(TestId, TestDetailTypeCd, SingleAgBead, SingleAgRaw, SingleAgNormalized, SingleAgSpecAbbr, SingleAgSpecificity)
+
+#Separate the Bw4/w6 specificities into a separate column.
+   %>% separate(SingleAgSpecAbbr, sep = ",", into = c("SAB_sero_spec", "SAB_Bw4Bw6_spec"))
+   )
+
+#Filter for all SAB results >= 1,000 MFI (our cutoff for a positive result).
+(Pos_SAB_results <- TestDetail_SAB %>% filter(SingleAgNormalized >= 1000))
+```
+
+```{r}
+#Join positive SAB results of to recipient/donor table by donor mismatch
+ 
+(A_1_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "A.1.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ A.1.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(A_2_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "A.2.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ A.2.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(B_1_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "B.1.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ B.1.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(B_2_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "B.2.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ B.2.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(C_1_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "Cw.1.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ Cw.1.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(C_2_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "Cw.2.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ Cw.2.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(DR_1_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "DR.1.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ DR.1.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(DR_2_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "DR.2.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ DR.2.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(DR51_52_53_1_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "DR.51.52.53.1.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ DR.51.52.53.1.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(DR51_52_53_2_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "DR.51.52.53.2.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ DR.51.52.53.2.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(DQ_1_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "DQ.1.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ DQ.1.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(DQ_2_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "DQ.2.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ DQ.2.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(DP_1_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "DP.1.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ DP.1.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+(DP_2_DSAs <- post_Tx_Ab_tests_MM_clean 
+   %>% left_join(Pos_SAB_results, by = c("TestId" = "TestId", "DP.2.mismatch" = "SAB_sero_spec"))
+   %>% mutate(DSA = case_when(!is.na(SingleAgNormalized) ~ DP.2.mismatch), .after = DP.2.mismatch)
+   %>% select(PatientId.recipient:DSA, SingleAgSpecificity, SingleAgNormalized)
+   )
+
+#Join all the tables into one
+(Study_DSAs <- bind_rows(A_1_DSAs, A_2_DSAs, B_1_DSAs, B_2_DSAs, C_1_DSAs, C_2_DSAs, DR_1_DSAs, DR_2_DSAs, DR51_52_53_1_DSAs, DR51_52_53_2_DSAs, DQ_1_DSAs, DQ_2_DSAs, DP_1_DSAs, DP_2_DSAs)
+    #Arrange by patient
+    %>% arrange(PatientId.recipient)
+    )
+
+#Now we have a list of all of the DSAs (in column DSA, if this column has value of "NA" there is not a DSA), the sample they came from (column SampleNbr), the date of the sample (column SampleDt), the specificity of the DSA (column SingleAgSpecificity), and the MFI of the DSA (column SingleAgNormalized). 
+```
+
+```{r}
+#Some sample code to analyze the DSA data
+
+#Find all positive DSA tests
+Study_DSAs %>% filter(!is.na(DSA))
+
+#Find all class I DSAs
+Study_DSAs %>% filter((str_detect(DSA, "A")) | (str_detect(DSA, "B"))| (str_detect(DSA, "C")))
+
+#Find all class II DSAs
+Study_DSAs %>% filter((str_detect(DSA, "DR")) | (str_detect(DSA, "DQ"))| (str_detect(DSA, "DP")))
+```
+
